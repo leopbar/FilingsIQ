@@ -1,0 +1,9 @@
+{
+  "job_id": "ftjob-33fdf3a110fe4e44b57f8338000dba03",
+  "train_file_id": "file-07a9c66ca8dd4f3fbcc9a31a34db168d",
+  "val_file_id": "file-c2d317d4da394105b4e962e56a9778af",
+  "base_model": "gpt-4o-2024-08-06",
+  "status": "succeeded",
+  "fine_tuned_model": "gpt-4o-2024-08-06.ft-33fdf3a110fe4e44b57f8338000dba03",
+  "finished_at": 1781643488
+}

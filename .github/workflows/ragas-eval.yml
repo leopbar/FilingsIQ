@@ -1,0 +1,70 @@
+# RAGAS eval gate (S7.4) — NOT LIVE YET.
+#
+# This project has no GitHub remote configured at the time this file was written
+# (local-only git history), so this workflow has never actually run in CI. It is
+# included as a ready-to-activate definition of what the gate would do once this
+# repo is pushed to GitHub with the secrets below configured.
+#
+# What it does once active: runs the 24-question golden eval set
+# (backend/data/eval/golden_qa.jsonl) through the live RAG pipeline, scores the
+# answers with RAGAS, then runs backend/eval_gate.py's category-aware pass/fail
+# check. The job fails (non-zero exit) if any threshold isn't met — see
+# backend/eval_gate.py and PROJECT_LOG.md (S7.3) for the thresholds and the
+# reasoning behind them.
+#
+# Cost note: this calls Azure OpenAI live (RAG answers + RAGAS judge calls) on
+# every run — the first manual run took ~74 minutes and a few dollars (see
+# PROJECT_LOG.md S7.2). For that reason this is NOT wired to run on every push;
+# it's manual (workflow_dispatch) and would need deliberate scheduling (e.g.
+# weekly) if ever made fully live.
+#
+# Required GitHub Actions secrets (mirror backend/.env, never commit the values):
+#   AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, AZURE_OPENAI_API_VERSION,
+#   AZURE_OPENAI_CHAT_DEPLOYMENT, AZURE_OPENAI_EMBEDDING_DEPLOYMENT,
+#   AZURE_SEARCH_ENDPOINT, AZURE_SEARCH_KEY
+
+name: RAGAS eval gate
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  ragas-eval:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Single venv: ragas_eval.py imports rag.py directly, and the eval venv's
+      # pinned openai==1.x (pulled in by langchain-openai) is what's actually been
+      # tested against rag.py — see requirements-eval.txt and PROJECT_LOG.md (S7.2)
+      # for why this is kept separate from the main app's requirements.txt.
+      - name: Install eval dependencies
+        run: pip install -r requirements-eval.txt
+
+      - name: Run RAGAS eval
+        env:
+          AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          AZURE_OPENAI_API_VERSION: ${{ secrets.AZURE_OPENAI_API_VERSION }}
+          AZURE_OPENAI_CHAT_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_CHAT_DEPLOYMENT }}
+          AZURE_OPENAI_EMBEDDING_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_EMBEDDING_DEPLOYMENT }}
+          AZURE_SEARCH_ENDPOINT: ${{ secrets.AZURE_SEARCH_ENDPOINT }}
+          AZURE_SEARCH_KEY: ${{ secrets.AZURE_SEARCH_KEY }}
+        run: python ragas_eval.py
+
+      - name: Evaluate pass/fail gate
+        run: python eval_gate.py
+
+      - name: Upload RAGAS results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ragas-results
+          path: backend/data/eval/ragas_results.json

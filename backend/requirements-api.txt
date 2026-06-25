@@ -1,0 +1,14 @@
+# Runtime dependencies for the API server (main.py, rag.py, upload.py).
+# Excludes offline-only tools: pyspark, mlflow, datasets, playwright, rich, requests.
+# Used by the Docker image; requirements.txt covers the full local dev environment.
+
+fastapi==0.115.0
+python-multipart==0.0.32
+uvicorn==0.30.6
+openai==2.41.1
+python-dotenv==1.0.1
+azure-search-documents==11.6.0
+azure-ai-documentintelligence==1.0.0
+azure-ai-textanalytics==5.3.0
+azure-ai-contentsafety==1.0.0
+azure-monitor-opentelemetry==1.6.4

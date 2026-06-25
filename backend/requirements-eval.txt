@@ -1,0 +1,16 @@
+# Separate venv (backend/venv-eval) for ragas_eval.py — kept apart from the main
+# backend/venv because ragas pulls in an older langchain + openai<2 stack that
+# conflicts with the main app's pinned openai==2.41.1 and mlflow's pyarrow<18 pin.
+#
+# Setup:
+#   python -m venv venv-eval
+#   venv-eval\Scripts\pip install -r requirements-eval.txt
+# Run:
+#   venv-eval\Scripts\python ragas_eval.py
+ragas==0.2.10
+langchain==0.3.25
+langchain-community==0.3.7
+langchain-core==0.3.63
+langchain-openai==0.3.19
+azure-search-documents==11.6.0
+python-dotenv==1.0.1
