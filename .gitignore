@@ -46,6 +46,13 @@ frontend/node_modules/
 frontend/.next/
 frontend/.env.local
 
+# Deck build tooling (pptxgenjs etc.) — keep the .pptx output, not node_modules
+docs/deck/node_modules/
+docs/deck/package-lock.json
+
 # OS
 .DS_Store
 Thumbs.db
+
+# Office lock files
+~$*
