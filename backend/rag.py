@@ -16,6 +16,8 @@ from azure.search.documents.models import VectorizedQuery
 from dotenv import load_dotenv
 from openai import AzureOpenAI
 
+from search_filters import build_search_filter
+
 # opentelemetry is only installed in the main app venv, not backend/venv-eval
 # (ragas_eval.py imports this module from venv-eval) — degrade to no-op spans
 # rather than fail the import when it's absent.
@@ -43,12 +45,18 @@ contain enough information to answer, say so clearly.
 """
 
 
-def ask(question: str, top_k: int = 5, year: str | None = None) -> dict:
+def ask(
+    question: str,
+    top_k: int = 5,
+    year: str | None = None,
+    ticker: str | None = None,
+) -> dict:
     """
     Embed the question, run hybrid search + semantic re-ranking in Azure AI Search,
     call GPT-4o with the top chunks, return answer + sources.
 
     Args:
+        ticker: Optional company ticker filter, e.g. "MSFT".
         year: Optional fiscal year filter, e.g. "FY2023". None means all years.
 
     Returns:
@@ -94,16 +102,58 @@ def ask(question: str, top_k: int = 5, year: str | None = None) -> dict:
             query_type="semantic",
             semantic_configuration_name="semantic-config",
             top=top_k,
-            select=["content"],
-            filter=f"year eq '{year}'" if year else None,
+            select=[
+                "content", "ticker", "company_name", "cik", "form_type",
+                "fiscal_year", "year", "filing_date", "accession_number", "sec_url",
+            ],
+            filter=build_search_filter(ticker, year),
         )
-        hits = [r["content"] for r in results]
+        hits = [dict(result) for result in results]
         if span:
+            span.set_attribute("rag.ticker_filter", ticker or "none")
             span.set_attribute("rag.year_filter", year or "none")
             span.set_attribute("rag.hits_returned", len(hits))
 
+    if not hits:
+        scope = "the selected filings"
+        if ticker:
+            scope = f"the indexed {ticker.upper()} filings"
+        return {
+            "answer": f"I could not find relevant excerpts in {scope}.",
+            "sources": [],
+            "citations": [],
+        }
+
     # Build context block for the prompt
-    context_lines = [f"[{i + 1}] {text.strip()}" for i, text in enumerate(hits)]
+    context_lines = []
+    citations = []
+    source_texts = []
+    for index, hit in enumerate(hits, 1):
+        content = str(hit["content"]).strip()
+        source_texts.append(content)
+        source_ticker = hit.get("ticker") or ("AAPL" if ticker == "AAPL" else "")
+        company_name = hit.get("company_name") or (
+            "Apple Inc." if source_ticker == "AAPL" else "Uploaded document"
+        )
+        fiscal_year = hit.get("fiscal_year") or hit.get("year") or ""
+        form_type = hit.get("form_type") or ("10-K" if fiscal_year != "upload" else "PDF")
+        filing_date = hit.get("filing_date") or ""
+        label_parts = [company_name, form_type, fiscal_year]
+        label = " · ".join(part for part in label_parts if part and part != "upload")
+        context_lines.append(f"[{index}] Source: {label}\n{content}")
+        citations.append(
+            {
+                "source_number": index,
+                "ticker": source_ticker,
+                "company_name": company_name,
+                "form_type": form_type,
+                "fiscal_year": fiscal_year,
+                "filing_date": filing_date,
+                "accession_number": hit.get("accession_number") or "",
+                "sec_url": hit.get("sec_url") or "",
+                "title": label or f"Source {index}",
+            }
+        )
     context_block = "\n\n---\n\n".join(context_lines)
     user_message = f"Document excerpts:\n\n{context_block}\n\nQuestion: {question}"
 
@@ -119,7 +169,8 @@ def ask(question: str, top_k: int = 5, year: str | None = None) -> dict:
         )
 
     logger.info(
-        "rag.ask completed: year_filter=%s hits=%d answer_chars=%d",
+        "rag.ask completed: ticker_filter=%s year_filter=%s hits=%d answer_chars=%d",
+        ticker or "none",
         year or "none",
         len(hits),
         len(chat_response.choices[0].message.content or ""),
@@ -127,7 +178,8 @@ def ask(question: str, top_k: int = 5, year: str | None = None) -> dict:
 
     return {
         "answer": chat_response.choices[0].message.content,
-        "sources": [text.strip() for text in hits],
+        "sources": source_texts,
+        "citations": citations,
     }
 
 
@@ -142,7 +194,7 @@ if __name__ == "__main__":
         else "What were Apple's total net sales in fiscal 2025?"
     )
     print(f"Question: {question}\n")
-    result = ask(question, year="FY2025")
+    result = ask(question, ticker="AAPL", year="FY2025")
     print("Answer:\n")
     print(result["answer"])
     print("\n--- Sources used ---")

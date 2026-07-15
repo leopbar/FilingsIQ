@@ -5,6 +5,9 @@ services:
       - "8000:8000"
     env_file:
       - ./backend/.env
+    environment:
+      # Local-only convenience. Public deployments should require authentication first.
+      ENABLE_COMPANY_IMPORT: "true"
 
   frontend:
     build:

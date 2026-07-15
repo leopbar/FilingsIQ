@@ -3,6 +3,8 @@ main.py — FastAPI app.
 
 Endpoints:
   POST /ask       — RAG chat (question → grounded answer with citations)
+  GET  /companies — indexed company and fiscal-year options
+  POST /companies/import — download and index a ticker's latest five 10-Ks
   POST /classify  — Clause classifier (clause → CUAD category, fine-tuned GPT-4o)
   POST /upload    — PDF upload (DI → PII → chunk → embed → index)
 
@@ -23,8 +25,10 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from openai import AzureOpenAI, NotFoundError
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
+from company_ingest import import_company, list_indexed_companies
+from edgar_download import EdgarError, normalize_ticker
 from rag import ask
 from upload import process_upload
 
@@ -95,8 +99,10 @@ FT_SYSTEM_MSG  = (
     "Reply with the category name only — no explanation."
 )
 
-# Thread pool for blocking upload pipeline (DI can take 1–2 min)
+# Thread pool for blocking document and SEC ingestion pipelines.
 _upload_executor = ThreadPoolExecutor(max_workers=2)
+_company_executor = ThreadPoolExecutor(max_workers=2)
+COMPANY_IMPORT_ENABLED = os.environ.get("ENABLE_COMPANY_IMPORT", "false").lower() == "true"
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +118,7 @@ app.add_middleware(
         "http://localhost:3001",
         "https://filingsiq-frontend.whitepebble-50a8bf56.eastus2.azurecontainerapps.io",
     ],
-    allow_methods=["POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -128,12 +134,30 @@ if _appinsights_conn:
 
 class AskRequest(BaseModel):
     question: str
+    ticker: Optional[str] = None
     year: Optional[str] = None
+
+
+class Citation(BaseModel):
+    source_number: int
+    ticker: str
+    company_name: str
+    form_type: str
+    fiscal_year: str
+    filing_date: str
+    accession_number: str
+    sec_url: str
+    title: str
 
 
 class AskResponse(BaseModel):
     answer: str
     sources: list[str]
+    citations: list[Citation] = Field(default_factory=list)
+
+
+class ImportCompanyRequest(BaseModel):
+    ticker: str
 
 
 class ClassifyRequest(BaseModel):
@@ -158,8 +182,49 @@ def ask_endpoint(body: AskRequest):
             status_code=400,
             detail="This question was flagged by content safety filters and could not be processed.",
         )
-    result = ask(body.question, year=body.year or None)
-    return AskResponse(answer=result["answer"], sources=result["sources"])
+    ticker = None
+    if body.ticker:
+        try:
+            ticker = normalize_ticker(body.ticker)
+        except EdgarError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    result = ask(body.question, ticker=ticker, year=body.year or None)
+    return AskResponse(
+        answer=result["answer"],
+        sources=result["sources"],
+        citations=result.get("citations", []),
+    )
+
+
+@app.get("/companies")
+def companies_endpoint():
+    try:
+        return {
+            "companies": list_indexed_companies(),
+            "import_enabled": COMPANY_IMPORT_ENABLED,
+        }
+    except Exception as exc:
+        logger.exception("Failed to list indexed companies")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/companies/import")
+async def import_company_endpoint(body: ImportCompanyRequest):
+    if not COMPANY_IMPORT_ENABLED:
+        raise HTTPException(
+            status_code=503,
+            detail="Company import is disabled on this deployment.",
+        )
+    try:
+        ticker = normalize_ticker(body.ticker)
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(_company_executor, import_company, ticker)
+        return result
+    except EdgarError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Company import failed for %s", body.ticker)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/classify", response_model=ClassifyResponse)

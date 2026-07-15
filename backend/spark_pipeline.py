@@ -1,5 +1,5 @@
 """
-spark_pipeline.py — PySpark batch ingestion pipeline for 5 Apple 10-K filings.
+spark_pipeline.py — PySpark batch ingestion pipeline for multi-company 10-K manifests.
 
 Architecture (hybrid — see ADR-004):
   - Spark DataFrames manage the job manifest and results.
@@ -15,9 +15,10 @@ Usage:
     python spark_pipeline.py
 """
 
+import concurrent.futures
+import json
 import os
 import time
-import concurrent.futures
 from pathlib import Path
 
 import mlflow
@@ -26,23 +27,10 @@ from dotenv import load_dotenv
 from openai import AzureOpenAI
 from azure.core.credentials import AzureKeyCredential
 from azure.search.documents import SearchClient
-from azure.search.documents.indexes import SearchIndexClient
-from azure.search.documents.indexes.models import (
-    HnswAlgorithmConfiguration,
-    SearchField,
-    SearchFieldDataType,
-    SearchIndex,
-    SearchableField,
-    SemanticConfiguration,
-    SemanticField,
-    SemanticPrioritizedFields,
-    SemanticSearch,
-    SimpleField,
-    VectorSearch,
-    VectorSearchProfile,
-)
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
+
+from search_schema import ensure_search_index
 
 
 # ---------------------------------------------------------------------------
@@ -54,7 +42,6 @@ FILINGS_DIR    = Path(__file__).parent / "data" / "filings"
 CHUNK_CHARS    = 2000
 OVERLAP_CHARS  = 200
 UPLOAD_BATCH   = 50
-VECTOR_DIM     = 1536
 MAX_WORKERS    = 5
 
 
@@ -88,46 +75,6 @@ def embed_chunks(client: AzureOpenAI, deployment: str, chunks: list[str]) -> lis
     return embeddings
 
 
-def ensure_pipeline_index(endpoint: str, key: str) -> None:
-    """Create filingsiq-pipeline-index if it does not already exist."""
-    idx_client = SearchIndexClient(endpoint, AzureKeyCredential(key))
-
-    fields = [
-        SimpleField(name="id",   type=SearchFieldDataType.String, key=True, filterable=True),
-        SearchableField(name="content", type=SearchFieldDataType.String),
-        SearchField(
-            name="embedding",
-            type=SearchFieldDataType.Collection(SearchFieldDataType.Single),
-            searchable=True,
-            vector_search_dimensions=VECTOR_DIM,
-            vector_search_profile_name="hnsw-profile",
-        ),
-        SimpleField(name="year", type=SearchFieldDataType.String, filterable=True),
-    ]
-
-    index = SearchIndex(
-        name=PIPELINE_INDEX,
-        fields=fields,
-        vector_search=VectorSearch(
-            algorithms=[HnswAlgorithmConfiguration(name="hnsw-config")],
-            profiles=[VectorSearchProfile(name="hnsw-profile", algorithm_configuration_name="hnsw-config")],
-        ),
-        semantic_search=SemanticSearch(
-            configurations=[
-                SemanticConfiguration(
-                    name="semantic-config",
-                    prioritized_fields=SemanticPrioritizedFields(
-                        content_fields=[SemanticField(field_name="content")]
-                    ),
-                )
-            ]
-        ),
-    )
-
-    idx_client.create_or_update_index(index)
-    print(f"Index '{PIPELINE_INDEX}' ready.")
-
-
 # ---------------------------------------------------------------------------
 # Per-filing worker — runs inside ThreadPoolExecutor
 # ---------------------------------------------------------------------------
@@ -137,7 +84,8 @@ def process_filing(row: dict) -> dict:
     Full pipeline for one filing: read -> chunk -> embed -> upload.
     Returns a result dict that becomes one row in the Spark results DataFrame.
     """
-    fy        = int(row["fiscal_year"])
+    fiscal_year = str(row["fiscal_year"])
+    ticker    = str(row["ticker"])
     file_path = str(row["file_path"])
 
     openai_client = AzureOpenAI(
@@ -162,11 +110,25 @@ def process_filing(row: dict) -> dict:
         chunks       = chunk_text(text)
         chunks_count = len(chunks)
 
-        print(f"  FY{fy}: {chunks_count} chunks — embedding ...")
+        print(f"  {ticker} {fiscal_year}: {chunks_count} chunks — embedding ...")
         embeddings = embed_chunks(openai_client, os.environ["AZURE_OPENAI_EMBEDDING_DEPLOYMENT"], chunks)
 
+        accession_key = str(row["accession_number"]).replace("-", "")
+        metadata = {
+            key: str(row[key])
+            for key in (
+                "ticker", "company_name", "cik", "form_type", "fiscal_year",
+                "filing_date", "accession_number", "sec_url",
+            )
+        }
         documents = [
-            {"id": f"fy{fy}-chunk-{i}", "content": chunk, "embedding": emb, "year": f"FY{fy}"}
+            {
+                "id": f"{ticker}-{accession_key}-chunk-{i}",
+                "content": chunk,
+                "embedding": emb,
+                "year": fiscal_year,
+                **metadata,
+            }
             for i, (chunk, emb) in enumerate(zip(chunks, embeddings))
         ]
 
@@ -178,15 +140,16 @@ def process_filing(row: dict) -> dict:
                 raise RuntimeError(f"Upload failed for keys: {[r.key for r in failed]}")
 
         uploaded = len(documents)
-        print(f"  FY{fy}: {uploaded} docs uploaded.")
+        print(f"  {ticker} {fiscal_year}: {uploaded} docs uploaded.")
 
     except Exception as exc:
         status    = "error"
         error_msg = str(exc)
-        print(f"  FY{fy}: ERROR — {error_msg}")
+        print(f"  {ticker} {fiscal_year}: ERROR — {error_msg}")
 
     return {
-        "fiscal_year": fy,
+        "ticker": ticker,
+        "fiscal_year": fiscal_year,
         "file_path":   file_path,
         "chunks":      chunks_count,
         "uploaded":    uploaded,
@@ -220,26 +183,30 @@ def main() -> None:
     print("Spark session started.\n")
 
     # Build manifest DataFrame
-    filings = sorted(FILINGS_DIR.glob("10k_FY*.txt"))
-    if not filings:
-        raise FileNotFoundError(f"No 10k_FY*.txt files found in {FILINGS_DIR}")
-
-    manifest_rows = [
-        {"fiscal_year": int(p.stem.replace("10k_FY", "")), "file_path": str(p)}
-        for p in filings
-    ]
+    manifest_rows = []
+    for manifest_path in sorted(FILINGS_DIR.glob("*/manifest.json")):
+        manifest_rows.extend(json.loads(manifest_path.read_text(encoding="utf-8")))
+    if not manifest_rows:
+        raise FileNotFoundError(
+            f"No company manifests found below {FILINGS_DIR}. "
+            "Run: python edgar_download.py <TICKER>"
+        )
     manifest_df = spark.createDataFrame(pd.DataFrame(manifest_rows))
 
     print("Manifest:")
     manifest_df.show(truncate=False)
 
     # Ensure the pipeline index exists before workers start
-    ensure_pipeline_index(os.environ["AZURE_SEARCH_ENDPOINT"], os.environ["AZURE_SEARCH_KEY"])
+    ensure_search_index(
+        os.environ["AZURE_SEARCH_ENDPOINT"],
+        os.environ["AZURE_SEARCH_KEY"],
+        PIPELINE_INDEX,
+    )
 
     rows_to_process = manifest_df.toPandas().to_dict("records")
 
     mlflow.set_experiment("filingsiq-pipeline")
-    with mlflow.start_run(run_name="batch-ingest-apple-10k"):
+    with mlflow.start_run(run_name="batch-ingest-multi-company-10k"):
 
         # Log pipeline configuration as parameters
         mlflow.log_params({
@@ -263,7 +230,7 @@ def main() -> None:
         results_df = spark.createDataFrame(pd.DataFrame(results))
 
         print("\nResults:")
-        results_df.select("fiscal_year", "chunks", "uploaded", "duration_s", "status").show()
+        results_df.select("ticker", "fiscal_year", "chunks", "uploaded", "duration_s", "status").show()
 
         totals = results_df.select(
             F.sum("chunks").alias("total_chunks"),
@@ -274,11 +241,11 @@ def main() -> None:
 
         # Log per-filing metrics
         for r in results:
-            fy = r["fiscal_year"]
+            metric_key = f"{r['ticker'].lower()}_{r['fiscal_year'].lower()}"
             mlflow.log_metrics({
-                f"fy{fy}_chunks":     r["chunks"],
-                f"fy{fy}_uploaded":   r["uploaded"],
-                f"fy{fy}_duration_s": r["duration_s"],
+                f"{metric_key}_chunks":     r["chunks"],
+                f"{metric_key}_uploaded":   r["uploaded"],
+                f"{metric_key}_duration_s": r["duration_s"],
             })
 
         # Log summary metrics

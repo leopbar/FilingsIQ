@@ -1,142 +1,183 @@
-"""
-edgar_download.py — fetch 5 years of Apple 10-K filings from EDGAR.
-
-Downloads the primary HTML document for each of the 5 most recent 10-K filings
-(FY2021-FY2025), strips HTML to plain text, and saves one file per fiscal year.
+"""Resolve any SEC ticker and download its latest 10-K filings from EDGAR.
 
 Usage:
-    python edgar_download.py
+    python edgar_download.py MSFT
 
-Output: backend/data/filings/10k_FY{year}.txt
+Output:
+    backend/data/filings/MSFT/manifest.json
+    backend/data/filings/MSFT/<accession-number>.txt
 """
 
+import argparse
+import html
+import json
 import os
 import re
 import time
-import requests
 from pathlib import Path
 
+import requests
 
-HEADERS = {
-    # EDGAR terms of service require a descriptive User-Agent with contact email.
-    "User-Agent": "FilingsIQ/1.0 lbarretti@gmail.com",
-    "Accept-Encoding": "gzip, deflate",
-}
+from filing_metadata import FilingMetadata
 
-CIK_PADDED = "0000320193"          # Apple Inc. — zero-padded to 10 digits
-CIK_SHORT   = CIK_PADDED.lstrip("0")  # "320193" — used in archive URLs
-SUBMISSIONS_URL = f"https://data.sec.gov/submissions/CIK{CIK_PADDED}.json"
-ARCHIVE_BASE    = "https://www.sec.gov/Archives/edgar/data"
-TARGET_COUNT    = 5  # most recent 10-K filings (FY2021-FY2025)
 
+TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
+SUBMISSIONS_BASE = "https://data.sec.gov/submissions"
+ARCHIVE_BASE = "https://www.sec.gov/Archives/edgar/data"
+TARGET_COUNT = 5
 OUT_DIR = Path(__file__).parent / "data" / "filings"
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def strip_html(html: str) -> str:
-    """Remove HTML markup and decode common entities; collapse excess whitespace."""
-    text = re.sub(r"<[^>]+>", " ", html)
-    text = re.sub(r"&nbsp;", " ", text)
-    text = re.sub(r"&amp;", "&", text)
-    text = re.sub(r"&lt;", "<", text)
-    text = re.sub(r"&gt;", ">", text)
-    text = re.sub(r"&#\d+;", " ", text)
-    text = re.sub(r"&[a-zA-Z]+;", " ", text)
-    text = re.sub(r"\s{3,}", "\n\n", text)
-    return text.strip()
+class EdgarError(RuntimeError):
+    """A user-facing EDGAR discovery or download error."""
 
 
-def get_10k_filings(submissions: dict) -> list[dict]:
-    """Return 10-K filing metadata rows from the EDGAR submissions JSON."""
-    recent = submissions["filings"]["recent"]
-    results = []
-    for i, form in enumerate(recent["form"]):
-        if form == "10-K":
-            accession_dashed = recent["accessionNumber"][i]
-            results.append({
-                "accession": accession_dashed.replace("-", ""),
-                "filed": recent["filingDate"][i],
-                "report_date": recent["reportDate"][i],
-                "primary_doc": recent["primaryDocument"][i],
-            })
-    return results  # newest first
+def _headers() -> dict[str, str]:
+    return {
+        "User-Agent": os.environ.get(
+            "SEC_USER_AGENT", "FilingsIQ/1.0 lbarretti@gmail.com"
+        ),
+        "Accept-Encoding": "gzip, deflate",
+    }
 
 
-def fiscal_year(report_date: str) -> int:
-    """Parse the fiscal year from reportDate (YYYY-MM-DD).
-
-    Apple's fiscal year ends in late September, so the calendar year of
-    reportDate equals the fiscal year number.
-    """
-    return int(report_date.split("-")[0])
+def _get_json(url: str, timeout: int = 30) -> dict:
+    response = requests.get(url, headers=_headers(), timeout=timeout)
+    response.raise_for_status()
+    return response.json()
 
 
-# ---------------------------------------------------------------------------
-# Download
-# ---------------------------------------------------------------------------
+def normalize_ticker(ticker: str) -> str:
+    value = ticker.strip().upper()
+    if not re.fullmatch(r"[A-Z0-9.-]{1,10}", value):
+        raise EdgarError("Ticker must contain 1–10 letters, numbers, periods, or hyphens.")
+    return value
 
-def download_filing(filing: dict, fy: int) -> Path:
-    """Download one 10-K, strip HTML, write to disk. Returns the output path."""
-    out_path = OUT_DIR / f"10k_FY{fy}.txt"
-    if out_path.exists():
-        size_kb = out_path.stat().st_size // 1024
-        print(f"  FY{fy}: already exists ({size_kb} KB), skipping.")
-        return out_path
 
-    url = (
-        f"{ARCHIVE_BASE}/{CIK_SHORT}"
-        f"/{filing['accession']}/{filing['primary_doc']}"
+def resolve_ticker(ticker: str) -> dict[str, str]:
+    """Resolve a ticker to the SEC's ten-digit CIK and conformed company name."""
+    normalized = normalize_ticker(ticker)
+    companies = _get_json(TICKERS_URL)
+    for company in companies.values():
+        if str(company["ticker"]).upper() == normalized:
+            return {
+                "ticker": normalized,
+                "company_name": str(company["title"]),
+                "cik": str(company["cik_str"]).zfill(10),
+            }
+    raise EdgarError(f"Ticker '{normalized}' was not found in the SEC company list.")
+
+
+def _recent_rows(submissions: dict) -> list[dict]:
+    recent = submissions.get("filings", {}).get("recent", {})
+    forms = recent.get("form", [])
+    return [
+        {name: values[index] for name, values in recent.items() if index < len(values)}
+        for index in range(len(forms))
+    ]
+
+
+def build_filing_manifest(ticker: str, count: int = TARGET_COUNT) -> list[dict[str, str]]:
+    """Return metadata for the newest available 10-K filings for one ticker."""
+    if not 1 <= count <= 10:
+        raise EdgarError("Filing count must be between 1 and 10.")
+
+    company = resolve_ticker(ticker)
+    submissions = _get_json(
+        f"{SUBMISSIONS_BASE}/CIK{company['cik']}.json"
     )
-    print(f"  FY{fy}: GET {url}")
-    resp = requests.get(url, headers=HEADERS, timeout=60)
-    resp.raise_for_status()
+    company_name = str(submissions.get("name") or company["company_name"])
+    cik_short = company["cik"].lstrip("0") or "0"
+    manifest: list[dict[str, str]] = []
 
-    text = strip_html(resp.text)
-    out_path.write_text(text, encoding="utf-8")
+    for row in _recent_rows(submissions):
+        if row.get("form") != "10-K":
+            continue
+        report_date = str(row.get("reportDate", ""))
+        accession_number = str(row.get("accessionNumber", ""))
+        primary_document = str(row.get("primaryDocument", ""))
+        if not report_date or not accession_number or not primary_document:
+            continue
 
-    size_kb = out_path.stat().st_size // 1024
-    print(f"  FY{fy}: saved {size_kb} KB -> {out_path.name}")
+        accession_compact = accession_number.replace("-", "")
+        sec_url = (
+            f"{ARCHIVE_BASE}/{cik_short}/{accession_compact}/{primary_document}"
+        )
+        metadata = FilingMetadata(
+            ticker=company["ticker"],
+            company_name=company_name,
+            cik=company["cik"],
+            form_type="10-K",
+            fiscal_year=f"FY{report_date[:4]}",
+            filing_date=str(row.get("filingDate", "")),
+            accession_number=accession_number,
+            sec_url=sec_url,
+        )
+        manifest.append(
+            {
+                **metadata.as_search_fields(),
+                "primary_document": primary_document,
+            }
+        )
+        if len(manifest) == count:
+            break
 
-    # EDGAR rate-limit guidance: no more than 10 requests/second.
-    time.sleep(0.5)
-    return out_path
+    if not manifest:
+        raise EdgarError(f"No 10-K filings were found for ticker '{company['ticker']}'.")
+    return manifest
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+def strip_html(source: str) -> str:
+    """Convert filing HTML to readable plain text without external parser dependencies."""
+    source = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", source)
+    source = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</tr>|</li>", "\n", source)
+    source = re.sub(r"<[^>]+>", " ", source)
+    source = html.unescape(source)
+    source = re.sub(r"[ \t]+", " ", source)
+    source = re.sub(r"\n\s*\n\s*\n+", "\n\n", source)
+    return source.strip()
+
+
+def fetch_filing_text(filing: dict[str, str]) -> str:
+    response = requests.get(filing["sec_url"], headers=_headers(), timeout=60)
+    response.raise_for_status()
+    time.sleep(0.2)
+    return strip_html(response.text)
+
+
+def download_company_filings(
+    ticker: str,
+    count: int = TARGET_COUNT,
+    out_dir: Path = OUT_DIR,
+) -> list[dict[str, str]]:
+    """Download filings and persist a machine-readable company manifest."""
+    manifest = build_filing_manifest(ticker, count=count)
+    company_dir = out_dir / manifest[0]["ticker"]
+    company_dir.mkdir(parents=True, exist_ok=True)
+
+    saved: list[dict[str, str]] = []
+    for filing in manifest:
+        path = company_dir / f"{filing['accession_number']}.txt"
+        if not path.exists():
+            path.write_text(fetch_filing_text(filing), encoding="utf-8")
+        saved.append({**filing, "file_path": str(path)})
+
+    manifest_path = company_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(saved, indent=2), encoding="utf-8")
+    return saved
+
 
 def main() -> None:
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    parser = argparse.ArgumentParser(description="Download a company's latest SEC 10-K filings.")
+    parser.add_argument("ticker", help="SEC-listed ticker, for example MSFT")
+    parser.add_argument("--count", type=int, default=TARGET_COUNT)
+    args = parser.parse_args()
 
-    print("Fetching Apple Inc. submissions from EDGAR …")
-    resp = requests.get(SUBMISSIONS_URL, headers=HEADERS, timeout=15)
-    resp.raise_for_status()
-    submissions = resp.json()
-
-    company = submissions.get("name", "Unknown")
-    print(f"  Company : {company}")
-    print(f"  CIK     : {CIK_PADDED}")
-
-    all_10k = get_10k_filings(submissions)
-    print(f"  Found {len(all_10k)} 10-K filings in recent history.")
-
-    targets = all_10k[:TARGET_COUNT]
-    print(f"\nDownloading {len(targets)} most-recent 10-K filings …")
-    for filing in targets:
-        fy = fiscal_year(filing["report_date"])
-        download_filing(filing, fy)
-
-    print("\nSummary:")
-    for path in sorted(OUT_DIR.glob("10k_FY*.txt")):
-        size_kb = path.stat().st_size // 1024
-        char_count = len(path.read_text(encoding="utf-8"))
-        print(f"  {path.name}   {size_kb:>5} KB   {char_count:>9,} chars")
-
-    print("\nDone.")
+    filings = download_company_filings(args.ticker, count=args.count)
+    first = filings[0]
+    print(f"Downloaded {len(filings)} filings for {first['company_name']} ({first['ticker']}).")
+    for filing in filings:
+        print(f"  {filing['fiscal_year']}  {filing['filing_date']}  {filing['file_path']}")
 
 
 if __name__ == "__main__":
