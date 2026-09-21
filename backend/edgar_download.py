@@ -14,7 +14,9 @@ import json
 import os
 import re
 import time
+import threading
 from pathlib import Path
+from typing import Iterable, Optional
 
 import requests
 
@@ -54,6 +56,52 @@ def normalize_ticker(ticker: str) -> str:
     return value
 
 
+_COMPANY_CACHE: dict = {"at": 0.0, "rows": []}
+_COMPANY_CACHE_LOCK = threading.Lock()
+_COMPANY_CACHE_TTL = 6 * 3600
+
+
+def _company_rows() -> list[dict[str, str]]:
+    """SEC's ticker list, cached in memory so search-as-you-type doesn't hit sec.gov."""
+    with _COMPANY_CACHE_LOCK:
+        if _COMPANY_CACHE["rows"] and time.time() - _COMPANY_CACHE["at"] < _COMPANY_CACHE_TTL:
+            return _COMPANY_CACHE["rows"]
+        companies = _get_json(TICKERS_URL)
+        rows = [
+            {
+                "ticker": str(c["ticker"]).upper(),
+                "company_name": str(c["title"]),
+                "cik": str(c["cik_str"]).zfill(10),
+            }
+            for c in companies.values()
+        ]
+        _COMPANY_CACHE.update(at=time.time(), rows=rows)
+        return rows
+
+
+def search_companies(query: str, limit: int = 8) -> list[dict[str, str]]:
+    """Find SEC-listed companies by ticker or name, best matches first."""
+    q = query.strip().lower()
+    if len(q) < 1:
+        return []
+    scored: list[tuple[int, str, dict[str, str]]] = []
+    for row in _company_rows():
+        ticker, name = row["ticker"].lower(), row["company_name"].lower()
+        if ticker == q:
+            score = 0
+        elif ticker.startswith(q):
+            score = 1
+        elif name.startswith(q):
+            score = 2
+        elif q in name:
+            score = 3
+        else:
+            continue
+        scored.append((score, name, row))
+    scored.sort(key=lambda item: (item[0], len(item[1]), item[1]))
+    return [row for _, _, row in scored[:limit]]
+
+
 def resolve_ticker(ticker: str) -> dict[str, str]:
     """Resolve a ticker to the SEC's ten-digit CIK and conformed company name."""
     normalized = normalize_ticker(ticker)
@@ -77,10 +125,18 @@ def _recent_rows(submissions: dict) -> list[dict]:
     ]
 
 
-def build_filing_manifest(ticker: str, count: int = TARGET_COUNT) -> list[dict[str, str]]:
-    """Return metadata for the newest available 10-K filings for one ticker."""
+def build_filing_manifest(
+    ticker: str,
+    count: int = TARGET_COUNT,
+    fiscal_years: Optional[Iterable[str]] = None,
+) -> list[dict[str, str]]:
+    """Return metadata for the newest available 10-K filings for one ticker.
+
+    With `fiscal_years` (e.g. {"FY2024", "FY2023"}) only those years are returned.
+    """
     if not 1 <= count <= 10:
         raise EdgarError("Filing count must be between 1 and 10.")
+    wanted = {y.upper() for y in fiscal_years} if fiscal_years else None
 
     company = resolve_ticker(ticker)
     submissions = _get_json(
@@ -99,6 +155,12 @@ def build_filing_manifest(ticker: str, count: int = TARGET_COUNT) -> list[dict[s
         if not report_date or not accession_number or not primary_document:
             continue
 
+        fiscal_year = f"FY{report_date[:4]}"
+        if wanted is not None and (
+            fiscal_year not in wanted or any(m["fiscal_year"] == fiscal_year for m in manifest)
+        ):
+            continue
+
         accession_compact = accession_number.replace("-", "")
         sec_url = (
             f"{ARCHIVE_BASE}/{cik_short}/{accession_compact}/{primary_document}"
@@ -108,7 +170,7 @@ def build_filing_manifest(ticker: str, count: int = TARGET_COUNT) -> list[dict[s
             company_name=company_name,
             cik=company["cik"],
             form_type="10-K",
-            fiscal_year=f"FY{report_date[:4]}",
+            fiscal_year=fiscal_year,
             filing_date=str(row.get("filingDate", "")),
             accession_number=accession_number,
             sec_url=sec_url,
@@ -119,9 +181,15 @@ def build_filing_manifest(ticker: str, count: int = TARGET_COUNT) -> list[dict[s
                 "primary_document": primary_document,
             }
         )
-        if len(manifest) == count:
+        if len(manifest) == (len(wanted) if wanted is not None else count):
             break
 
+    if wanted is not None:
+        missing = sorted(wanted - {m["fiscal_year"] for m in manifest})
+        if missing:
+            raise EdgarError(
+                f"No 10-K found for {company['ticker']} in: {', '.join(missing)}."
+            )
     if not manifest:
         raise EdgarError(f"No 10-K filings were found for ticker '{company['ticker']}'.")
     return manifest
@@ -149,9 +217,10 @@ def download_company_filings(
     ticker: str,
     count: int = TARGET_COUNT,
     out_dir: Path = OUT_DIR,
+    fiscal_years: Optional[Iterable[str]] = None,
 ) -> list[dict[str, str]]:
     """Download filings and persist a machine-readable company manifest."""
-    manifest = build_filing_manifest(ticker, count=count)
+    manifest = build_filing_manifest(ticker, count=count, fiscal_years=fiscal_years)
     company_dir = out_dir / manifest[0]["ticker"]
     company_dir.mkdir(parents=True, exist_ok=True)
 

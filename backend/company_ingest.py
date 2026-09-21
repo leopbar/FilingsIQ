@@ -3,6 +3,7 @@
 import os
 import time
 from pathlib import Path
+from typing import Callable, Iterable, Optional
 
 from azure.core.credentials import AzureKeyCredential
 from azure.search.documents import SearchClient
@@ -48,16 +49,29 @@ def _escape_filter(value: str) -> str:
     return value.replace("'", "''")
 
 
-def _company_filter(ticker: str) -> str:
+def _company_filter(ticker: str, fiscal_years: Optional[Iterable[str]] = None) -> str:
+    """Filter matching a company's indexed 10-K chunks, optionally limited to some years."""
+    years = sorted(fiscal_years) if fiscal_years else None
     current = f"ticker eq '{_escape_filter(ticker)}' and form_type eq '10-K'"
+    if years:
+        clause = " or ".join(f"fiscal_year eq '{_escape_filter(y)}'" for y in years)
+        current += f" and ({clause})"
     if ticker == "AAPL":
         # S9 migration only: the original 640 Apple chunks predate all metadata.
-        return f"({current}) or (ticker eq null and year ne 'upload')"
+        legacy = "ticker eq null and year ne 'upload'"
+        if years:
+            clause = " or ".join(f"year eq '{_escape_filter(y)}'" for y in years)
+            legacy += f" and ({clause})"
+        return f"({current}) or ({legacy})"
     return current
 
 
-def _delete_company_documents(search_client: SearchClient, ticker: str) -> int:
-    target_filter = _company_filter(ticker)
+def _delete_company_documents(
+    search_client: SearchClient,
+    ticker: str,
+    fiscal_years: Optional[Iterable[str]] = None,
+) -> int:
+    target_filter = _company_filter(ticker, fiscal_years)
     results = search_client.search(
         search_text="*",
         filter=target_filter,
@@ -86,9 +100,20 @@ def _delete_company_documents(search_client: SearchClient, ticker: str) -> int:
     return len(ids)
 
 
-def import_company(ticker: str, count: int = 5) -> dict:
-    """Download, embed, and atomically replace one company's indexed 10-K set."""
+def import_company(
+    ticker: str,
+    count: int = 5,
+    fiscal_years: Optional[Iterable[str]] = None,
+    progress: Optional[Callable[[str], None]] = None,
+) -> dict:
+    """Download, embed, and replace a company's indexed 10-Ks.
+
+    Without `fiscal_years` the company's whole 10-K set is replaced. With it, only
+    those fiscal years are replaced and the company's other years are left alone.
+    """
     load_dotenv()
+    say = progress or (lambda _message: None)
+    years = sorted({y.upper() for y in fiscal_years}) if fiscal_years else None
     ticker = normalize_ticker(ticker)
     index_name = os.environ.get("AZURE_SEARCH_PIPELINE_INDEX_NAME", "filingsiq-pipeline-index")
     ensure_search_index(
@@ -97,7 +122,8 @@ def import_company(ticker: str, count: int = 5) -> dict:
         index_name,
     )
 
-    filings = download_company_filings(ticker, count=count)
+    say("Downloading filings from SEC EDGAR")
+    filings = download_company_filings(ticker, count=count, fiscal_years=years)
     openai_client = AzureOpenAI(
         azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
         api_key=os.environ["AZURE_OPENAI_API_KEY"],
@@ -107,7 +133,8 @@ def import_company(ticker: str, count: int = 5) -> dict:
     filing_summaries: list[dict] = []
 
     # Prepare every replacement document before deleting the currently indexed set.
-    for filing in filings:
+    for position, filing in enumerate(filings, start=1):
+        say(f"Embedding {filing['fiscal_year']} ({position}/{len(filings)})")
         chunks = _chunk_text(Path(filing["file_path"]).read_text(encoding="utf-8"))
         embeddings = _embed(
             openai_client,
@@ -153,7 +180,8 @@ def import_company(ticker: str, count: int = 5) -> dict:
         index_name=index_name,
         credential=AzureKeyCredential(os.environ["AZURE_SEARCH_KEY"]),
     )
-    replaced = _delete_company_documents(search_client, ticker)
+    say("Writing to the search index")
+    replaced = _delete_company_documents(search_client, ticker, years)
     for start in range(0, len(documents), UPLOAD_BATCH):
         results = search_client.upload_documents(documents=documents[start : start + UPLOAD_BATCH])
         failed = [result.key for result in results if not result.succeeded]

@@ -5,6 +5,10 @@ Endpoints:
   POST /ask       — RAG chat (question → grounded answer with citations)
   GET  /companies — indexed company and fiscal-year options
   POST /companies/import — download and index a ticker's latest five 10-Ks
+  GET  /sec/search        — search SEC-listed companies by name or ticker
+  GET  /sec/filings       — 10-K filings EDGAR has for a ticker
+  POST /sec/import        — start a background import of up to 2 fiscal years
+  GET  /sec/import/{id}   — poll an import job
   POST /classify  — Clause classifier (clause → CUAD category, fine-tuned GPT-4o)
   POST /upload    — PDF upload (DI → PII → chunk → embed → index)
 
@@ -28,7 +32,8 @@ from openai import AzureOpenAI, NotFoundError
 from pydantic import BaseModel, Field
 
 from company_ingest import import_company, list_indexed_companies
-from edgar_download import EdgarError, normalize_ticker
+from edgar_download import EdgarError, normalize_ticker, search_companies
+from import_jobs import MAX_YEARS_PER_IMPORT, get_job, list_available_filings, start_import
 from rag import ask
 from upload import process_upload
 
@@ -160,6 +165,11 @@ class ImportCompanyRequest(BaseModel):
     ticker: str
 
 
+class SecImportRequest(BaseModel):
+    ticker: str
+    fiscal_years: list[str]
+
+
 class ClassifyRequest(BaseModel):
     clause: str
 
@@ -225,6 +235,59 @@ async def import_company_endpoint(body: ImportCompanyRequest):
     except Exception as exc:
         logger.exception("Company import failed for %s", body.ticker)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+def _require_import_enabled() -> None:
+    if not COMPANY_IMPORT_ENABLED:
+        raise HTTPException(status_code=503, detail="Company import is disabled on this deployment.")
+
+
+@app.get("/sec/search")
+async def sec_search_endpoint(q: str = ""):
+    _require_import_enabled()
+    try:
+        loop = asyncio.get_running_loop()
+        results = await loop.run_in_executor(None, search_companies, q)
+        return {"results": results}
+    except Exception as exc:
+        logger.exception("SEC company search failed")
+        raise HTTPException(status_code=502, detail=f"SEC search failed: {exc}") from exc
+
+
+@app.get("/sec/filings")
+async def sec_filings_endpoint(ticker: str):
+    _require_import_enabled()
+    try:
+        loop = asyncio.get_running_loop()
+        filings = await loop.run_in_executor(None, list_available_filings, ticker)
+        return {
+            "ticker": normalize_ticker(ticker),
+            "filings": filings,
+            "max_years": MAX_YEARS_PER_IMPORT,
+        }
+    except EdgarError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("SEC filing lookup failed for %s", ticker)
+        raise HTTPException(status_code=502, detail=f"SEC lookup failed: {exc}") from exc
+
+
+@app.post("/sec/import")
+def sec_import_endpoint(body: SecImportRequest):
+    _require_import_enabled()
+    try:
+        return start_import(body.ticker, body.fiscal_years)
+    except EdgarError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/sec/import/{job_id}")
+def sec_import_status_endpoint(job_id: str):
+    _require_import_enabled()
+    job = get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Import job not found (it may have expired).")
+    return job
 
 
 @app.post("/classify", response_model=ClassifyResponse)
