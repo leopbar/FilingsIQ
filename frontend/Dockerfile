@@ -8,11 +8,6 @@ RUN npm ci
 FROM node:20-alpine AS builder
 WORKDIR /app
 
-# API URL is baked in at build time for client-side fetches.
-# Override with --build-arg NEXT_PUBLIC_API_URL=https://... at deploy time.
-ARG NEXT_PUBLIC_API_URL=http://localhost:8000
-ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
-
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 RUN npm run build

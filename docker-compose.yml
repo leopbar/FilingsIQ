@@ -12,9 +12,9 @@ services:
   frontend:
     build:
       context: ./frontend
-      args:
-        # Browser fetches go to localhost:8000 — the backend port exposed above.
-        NEXT_PUBLIC_API_URL: http://localhost:8000
+    environment:
+      # Next.js proxies browser requests to FastAPI over the Compose service network.
+      BACKEND_API_URL: http://backend:8000
     ports:
       - "3001:3000"
     depends_on:
