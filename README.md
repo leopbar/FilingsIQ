@@ -18,24 +18,32 @@ application.
 
 ## What it does
 
-- **Ask questions** about Apple's 10-K filings (FY2021–FY2025) or upload your own PDF and chat
-  with it instead.
+- **Search and add any SEC-listed company** from the live app — search by name or ticker,
+  preview its available 10-Ks, and import up to 2 fiscal years at a time as a background job
+  with live progress. Re-running an import only re-embeds the years you picked; a company's
+  other indexed years are left alone.
+- **Ask questions** about any indexed company's 10-K filings, or upload your own PDF and chat
+  with it instead — the manual upload path (Document Intelligence → PII redaction → index) is
+  unchanged and always available.
 - **Filter by fiscal year** to scope answers to a specific filing, or leave it open for
   cross-year questions.
 - **Classify legal clauses** into one of 41 standard contract-clause categories using a model
   fine-tuned specifically for that task.
 - Every answer is **grounded and cited** — the model is instructed to answer only from retrieved
-  excerpts, with inline `[1]`, `[2]`… citations linking back to the exact source text.
+  excerpts, with inline `[1]`, `[2]`… citations that expand in the UI to show the exact source
+  excerpt and a link to the filing on sec.gov.
 - Harmful or out-of-scope input is **screened before it reaches the model**, and every request is
   traced end-to-end in Application Insights.
+- A sidebar of indexed companies, a chat-thread UI with citation chips, and a **light/dark theme
+  toggle**.
 
 ---
 
 ## Architecture
 
 ```
-Browser (Next.js chat UI)
-      │  POST /ask  { question, year? }
+Browser (Next.js chat UI: sidebar + chat thread)
+      │  POST /ask  { question, ticker?, year? }
       ▼
 FastAPI backend
       │  0. screen question        → Azure AI Content Safety (fails open, returns 400 if blocked)
@@ -44,20 +52,29 @@ FastAPI backend
       │  3. generate grounded answer → Azure OpenAI (gpt-4o), cited from retrieved chunks
       │  ↳ every step traced       → Application Insights (OpenTelemetry spans)
       ▼
-{ answer, sources }
+{ answer, sources, citations }
 
-Offline ingestion pipeline (PDF → searchable index):
+SEC company search + import (POST /sec/import, background job):
+  search/filings ──EDGAR──▶ pick ≤2 fiscal years ──chunk + embed──▶ Azure AI Search
+                                                                    (replaces only those years)
+
+Manual PDF ingestion (POST /upload, unchanged):
   filing.pdf ──Document Intelligence──▶ layout markdown ──Azure AI Language──▶ PII-redacted
              ──chunk + embed──▶ Azure AI Search index
 
-Batch pipeline (5 years of filings at once):
+Batch pipeline (5 years of filings at once, offline):
   EDGAR ──PySpark + MLflow──▶ parallel chunk/embed/upload, every run tracked
 ```
 
 **Two retrieval indexes:**
 - `filingsiq-index` — the original single-document Apple FY2025 10-K (Stage 1–3).
-- `filingsiq-pipeline-index` — Apple FY2021–FY2025 (built by the Spark pipeline) plus
-  whichever document is currently uploaded through the live app's "Upload a PDF" panel.
+- `filingsiq-pipeline-index` — every company added since (Apple, Microsoft, and whatever has been
+  searched and imported through the live app) plus whichever document is currently uploaded
+  through "Upload a PDF."
+
+See [ADR-007](docs/adr/ADR-007-sec-search-and-ui-redesign.md) for why import is public but capped
+at 2 fiscal years per request, and why it replaces only the requested years instead of a
+company's whole filing set.
 
 ---
 
@@ -86,7 +103,7 @@ Batch pipeline (5 years of filings at once):
 | 8 | PySpark + scalable data pipelines | ✅ | Hybrid Spark + MLflow batch pipeline — [ADR-004](docs/adr/ADR-004-pyspark-pipeline.md) |
 | 9 | MLOps / LLMOps | ✅ | RAGAS eval gate, Application Insights tracing, Content Safety screening — [ADR-006](docs/adr/ADR-006-mlops-llmops.md) |
 | 10 | Customer enablement / presentations | ✅ | This README + ADR set |
-| — | Build & deploy an enterprise-grade application | ✅ | Live on Azure Container Apps |
+| — | Build & deploy an enterprise-grade application | ✅ | Live on Azure Container Apps; self-service company search — [ADR-007](docs/adr/ADR-007-sec-search-and-ui-redesign.md) |
 
 See [`docs/adr/`](docs/adr/) for the full set of Architecture Decision Records — each documents
 the context, decision, alternatives considered, and a dev-vs-production-target comparison.
@@ -99,7 +116,7 @@ the context, decision, alternatives considered, and a dev-vs-production-target c
 Intelligence · AI Language · AI Content Safety · Application Insights · Key Vault · Container
 Registry · Container Apps.
 
-**App:** FastAPI (Python) · Next.js 16 + TypeScript + Tailwind + shadcn/ui.
+**App:** FastAPI (Python) · Next.js 16 + TypeScript + Tailwind + shadcn/ui + Base UI.
 
 **Data/ML:** PySpark · MLflow · RAGAS · CUAD dataset.
 
@@ -139,9 +156,9 @@ Frontend runs at `http://localhost:3000`.
 docker compose up --build
 ```
 
-> **Note:** ingestion (`ingest.py`, `upload.py`, `spark_pipeline.py`) talks to live Azure
-> services and will incur costs. The live app's indexes are already populated — local setup is
-> only needed if you want to rebuild the pipeline yourself.
+> **Note:** ingestion (`ingest.py`, `upload.py`, `spark_pipeline.py`, SEC company search/import)
+> talks to live Azure services and will incur costs. The live app's indexes are already
+> populated — local setup is only needed if you want to rebuild the pipeline yourself.
 
 ---
 
@@ -150,7 +167,7 @@ docker compose up --build
 ```
 FilingsIQ/
   backend/
-    main.py              # FastAPI app: POST /ask, /classify, /upload
+    main.py              # FastAPI app: /ask, /companies, /sec/*, /classify, /upload
     rag.py                # hybrid + semantic retrieval → gpt-4o grounded answer
     upload.py             # PDF upload pipeline: DI extract → PII redact → chunk → embed → index
     ingest.py             # chunk → embed → upload (single-document ingestion)
@@ -158,17 +175,28 @@ FilingsIQ/
     di_extract.py          # Document Intelligence layout extraction
     pii_redact.py          # Azure AI Language PII redaction
     spark_pipeline.py     # PySpark + MLflow batch pipeline (5 years of filings)
-    edgar_download.py     # downloads filings from SEC EDGAR
+    edgar_download.py     # SEC EDGAR: company search, filing discovery, download
+    company_ingest.py     # persistent multi-company chunk/embed/replace (year-scoped)
+    import_jobs.py        # background SEC import jobs: validation, progress, polling
     prepare_cuad.py / baseline_eval.py / run_finetune.py / ft_eval.py / compare.py
                            # fine-tuning pipeline: data prep → baseline → train → eval → compare
     ragas_eval.py / eval_gate.py
                            # RAGAS quality evaluation + pass/fail threshold gate
+    test_stage9.py / test_sec_search_import.py
+                           # offline regression tests
     Dockerfile / requirements*.txt
   frontend/
-    app/page.tsx          # chat UI: ask, year filter, PDF upload, clause classifier
-    components/ui/        # shadcn/ui components
+    app/page.tsx          # server component: loads companies, renders FilingsClient
+    app/filings-client.tsx # sidebar + chat thread: ask, SEC search, upload, classifier
+    app/api/[...path]/route.ts # same-origin proxy to the backend
+    components/sec-import-dialog.tsx # search → pick ≤2 years → live import progress
+    components/tool-dialogs.tsx      # upload and clause-classifier dialogs
+    components/answer-view.tsx       # renders answers with clickable citation chips
+    components/theme-toggle.tsx      # light/dark toggle
+    components/ui/                   # shadcn/ui + Base UI primitives
+    lib/api.ts             # typed client for every backend endpoint
     Dockerfile
-  docs/adr/                # Architecture Decision Records (ADR-001…006)
+  docs/adr/                # Architecture Decision Records (ADR-001…007)
   .github/workflows/        # RAGAS eval CI workflow (manual trigger)
   docker-compose.yml
 ```
@@ -177,6 +205,12 @@ FilingsIQ/
 
 ## Known limitations (documented honestly, not hidden)
 
+- **SEC company search/import has no authentication.** Anyone with the live URL can trigger an
+  import. The 2-fiscal-year cap and single-job-at-a-time queue bound the cost and blast radius
+  of any one request, but this is a cost control, not an access control — see
+  [ADR-007](docs/adr/ADR-007-sec-search-and-ui-redesign.md).
+- **Import job progress is kept in memory**, not a durable store, so it does not survive a
+  container restart mid-import and requires the backend to run a single replica.
 - **Cross-document synthesis is weak.** Questions spanning all years without a `year` filter
   (e.g. "which fiscal year had the highest net income?") sometimes miss the right chunk in
   unfiltered retrieval over the multi-year index — a known retrieval-quality gap, tracked in

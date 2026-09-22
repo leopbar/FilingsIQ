@@ -11,8 +11,9 @@ plus a dev-vs-production-target comparison. Read in order — each stage builds 
 | [ADR-004](ADR-004-pyspark-pipeline.md) | **Hybrid Spark + `concurrent.futures` + MLflow** batch pipeline | Spark DataFrames manage the manifest/results; driver-side threading does the actual work (Windows + Python 3.12 + PySpark 3.5.3 breaks Python worker subprocesses) — framed honestly as the local-dev path vs. `mapInPandas` on a real cluster. |
 | [ADR-005](ADR-005-deployment.md) | Deploy to **Azure Container Apps** with **Key Vault + Managed Identity** | No plaintext secret ever touched a command line, file, or chat transcript — Key Vault + system-assigned identities for both the app and the ACR pull, closing the "enterprise-grade vs. free-tier" credibility gap. |
 | [ADR-006](ADR-006-mlops-llmops.md) | **RAGAS eval gate + Application Insights + Content Safety** | Category-aware quality thresholds (not one flat bar — a DI table-flattening artifact and a real cross-document retrieval gap needed different treatment), full request tracing in production, and fail-open input screening. |
+| [ADR-007](ADR-007-sec-search-and-ui-redesign.md) | **SEC company search (2-year-capped background import) + UI redesign** | Turned import from disabled-in-production to public-but-cost-bounded (2 fiscal years per job, one job at a time, `maxReplicas=1`); year-scoped replacement instead of whole-company re-embed; sidebar + chat-thread UI with a light/dark toggle. |
 
-## Recurring themes across all six
+## Recurring themes across all seven
 
 - **Honest framing over hidden gaps.** Every ADR that hit a real limitation (Windows/PySpark,
   CLI bugs, retrieval weaknesses, RAGAS metric quirks) documents it explicitly rather than
@@ -24,3 +25,8 @@ plus a dev-vs-production-target comparison. Read in order — each stage builds 
   a real Databricks cluster).
 - **No secret ever in plaintext.** From ADR-005 onward, every credential goes through Key Vault
   via a temp-file pattern — never a literal CLI argument, tracked file, or chat message.
+- **Cost-bounding instead of feature-disabling.** ADR-007 revisits ADR-005/Stage 9's
+  disabled-in-production import flag: rather than leave a useful feature off indefinitely, it
+  bounds each request's cost and concurrency (2 years, one job at a time, single replica) so the
+  feature can ship live while the real gap — no authentication — stays explicitly documented
+  rather than papered over.
