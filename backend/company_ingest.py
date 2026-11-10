@@ -1,5 +1,6 @@
 """Persistent multi-company SEC 10-K ingestion for the FilingsIQ API."""
 
+import logging
 import os
 import time
 from pathlib import Path
@@ -13,11 +14,13 @@ from openai import AzureOpenAI
 from edgar_download import download_company_filings, normalize_ticker
 from search_schema import ensure_search_index
 
+logger = logging.getLogger(__name__)
 
 CHUNK_CHARS = 2000
 OVERLAP_CHARS = 200
 EMBED_BATCH = 16
 UPLOAD_BATCH = 50
+SEARCH_PAGE_SIZE = 1000
 
 
 def _chunk_text(text: str) -> list[str]:
@@ -66,38 +69,68 @@ def _company_filter(ticker: str, fiscal_years: Optional[Iterable[str]] = None) -
     return current
 
 
-def _delete_company_documents(
+def _existing_chunk_ids(
     search_client: SearchClient,
     ticker: str,
     fiscal_years: Optional[Iterable[str]] = None,
-) -> int:
-    target_filter = _company_filter(ticker, fiscal_years)
+) -> set[str]:
+    """Return the IDs of the chunks currently indexed for a company and its selected years.
+
+    Reading past the first page of results is unreliable without a sortable key, so a
+    selection too large for one page is refused instead of replaced from a partial list.
+    """
     results = search_client.search(
         search_text="*",
-        filter=target_filter,
+        filter=_company_filter(ticker, fiscal_years),
         select=["id"],
-        top=1000,
+        top=SEARCH_PAGE_SIZE,
+        include_total_count=True,
     )
-    ids = [{"id": row["id"]} for row in results]
-    for start in range(0, len(ids), UPLOAD_BATCH):
-        search_client.delete_documents(documents=ids[start : start + UPLOAD_BATCH])
-    if ids:
-        deadline = time.time() + 180
-        while time.time() < deadline:
-            remaining = search_client.search(
-                search_text="*",
-                filter=target_filter,
-                top=0,
-                include_total_count=True,
-            ).get_count()
-            if not remaining:
-                break
-            time.sleep(2)
-        else:
-            raise TimeoutError(
-                f"Azure Search did not finish deleting {ticker} chunks within 180 seconds."
-            )
-    return len(ids)
+    ids = {row["id"] for row in results}
+    total = results.get_count()
+    if total != len(ids):
+        raise RuntimeError(
+            f"{ticker} has {total} chunks in this selection, too many to replace safely "
+            f"in one import (limit {SEARCH_PAGE_SIZE}). Nothing was changed."
+        )
+    return ids
+
+
+def _delete_chunks(search_client: SearchClient, ids: Iterable[str]) -> None:
+    documents = [{"id": chunk_id} for chunk_id in ids]
+    for start in range(0, len(documents), UPLOAD_BATCH):
+        search_client.delete_documents(documents=documents[start : start + UPLOAD_BATCH])
+
+
+def _replace_chunks(
+    search_client: SearchClient,
+    documents: list[dict],
+    existing_ids: set[str],
+) -> None:
+    """Write the new chunks, and remove the ones they supersede only after that succeeds.
+
+    The service can reject an upload, for example when its storage quota is full, and
+    that must not cost a company the filings it already has indexed. Chunk IDs are
+    deterministic, so re-importing a filing overwrites its chunks in place.
+    """
+    written: set[str] = set()
+    try:
+        for start in range(0, len(documents), UPLOAD_BATCH):
+            batch = documents[start : start + UPLOAD_BATCH]
+            written.update(document["id"] for document in batch)
+            results = search_client.upload_documents(documents=batch)
+            failed = [result.key for result in results if not result.succeeded]
+            if failed:
+                raise RuntimeError(f"Azure Search rejected chunk IDs: {failed}")
+    except Exception:
+        # Remove only what this import added. Chunks that were already indexed stay.
+        try:
+            _delete_chunks(search_client, written - existing_ids)
+        except Exception:
+            logger.exception("Could not remove a partial upload; re-raising the original error.")
+        raise
+
+    _delete_chunks(search_client, existing_ids - {document["id"] for document in documents})
 
 
 def import_company(
@@ -132,7 +165,7 @@ def import_company(
     documents: list[dict] = []
     filing_summaries: list[dict] = []
 
-    # Prepare every replacement document before deleting the currently indexed set.
+    # Prepare every replacement document before touching the search index.
     for position, filing in enumerate(filings, start=1):
         say(f"Embedding {filing['fiscal_year']} ({position}/{len(filings)})")
         chunks = _chunk_text(Path(filing["file_path"]).read_text(encoding="utf-8"))
@@ -181,12 +214,8 @@ def import_company(
         credential=AzureKeyCredential(os.environ["AZURE_SEARCH_KEY"]),
     )
     say("Writing to the search index")
-    replaced = _delete_company_documents(search_client, ticker, years)
-    for start in range(0, len(documents), UPLOAD_BATCH):
-        results = search_client.upload_documents(documents=documents[start : start + UPLOAD_BATCH])
-        failed = [result.key for result in results if not result.succeeded]
-        if failed:
-            raise RuntimeError(f"Azure Search rejected chunk IDs: {failed}")
+    existing_ids = _existing_chunk_ids(search_client, ticker, years)
+    _replace_chunks(search_client, documents, existing_ids)
 
     return {
         "ticker": ticker,
@@ -195,7 +224,7 @@ def import_company(
         "filings": filing_summaries,
         "filing_count": len(filings),
         "chunks": len(documents),
-        "replaced_chunks": replaced,
+        "replaced_chunks": len(existing_ids),
     }
 
 

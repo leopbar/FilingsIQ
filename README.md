@@ -66,9 +66,8 @@ Batch pipeline (5 years of filings at once, offline):
   EDGAR ──PySpark + MLflow──▶ parallel chunk/embed/upload, every run tracked
 ```
 
-**Two retrieval indexes:**
-- `filingsiq-index` — the original single-document Apple FY2025 10-K (Stage 1–3).
-- `filingsiq-pipeline-index` — every company added since (Apple, Microsoft, and whatever has been
+**Retrieval index:**
+- `filingsiq-pipeline-index` — every company (Apple, Microsoft, and whatever has been
   searched and imported through the live app) plus whichever document is currently uploaded
   through "Upload a PDF."
 
